@@ -20,7 +20,8 @@ from PIL import Image
 
 
 def txtread(path):
-    path = os.path.expanduser(path)
+    # path = os.path.expanduser(path)
+    path = 'confs/face_example.yml'
     with open(path, 'r') as f:
         return f.read()
 

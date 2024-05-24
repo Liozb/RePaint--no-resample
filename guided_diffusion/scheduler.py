@@ -178,7 +178,7 @@ def get_schedule_jump_paper():
 
 def get_schedule_jump_test(to_supplement=False):
     ts = get_schedule_jump(t_T=250, n_sample=1,
-                           jump_length=10, jump_n_sample=10,
+                           jump_length=1, jump_n_sample=1,
                            jump2_length=1, jump2_n_sample=1,
                            jump3_length=1, jump3_n_sample=1,
                            start_resampling=250)

@@ -27,6 +27,7 @@ import time
 import conf_mgt
 from utils import yamlread
 from guided_diffusion import dist_util
+import numpy as np
 
 # Workaround
 try:
@@ -60,8 +61,22 @@ def main(conf: conf_mgt.Default_Conf):
 
     print("Start", conf['name'])
 
-    device = dist_util.dev(conf.get('device'))
+    # If CUDA avaliable use CUDA
+    gpu_ids = [2]
+    devices = []
+    gpu_enable = True
 
+    if th.cuda.is_available and gpu_enable:
+        if len(gpu_ids) == 1:
+            device = th.device("cuda", gpu_ids[0])
+        else:
+            for gpu in gpu_ids:      
+                device = th.device("cuda", gpu)
+                devices.append(device)
+    else:
+        device = th.device("cpu")
+        
+    # device = dist_util.dev(conf.get('device'))
 
     model, diffusion = create_model_and_diffusion(
         **select_args(conf, model_and_diffusion_defaults().keys()), conf=conf
@@ -70,7 +85,9 @@ def main(conf: conf_mgt.Default_Conf):
         dist_util.load_state_dict(os.path.expanduser(
             conf.model_path), map_location="cpu")
     )
+    model = th.nn.DataParallel(model, device_ids=[2, 3])
     model.to(device)
+    
     if conf.use_fp16:
         model.convert_to_fp16()
     model.eval()
@@ -116,56 +133,93 @@ def main(conf: conf_mgt.Default_Conf):
     dl = conf.get_dataloader(dset=dset, dsName=eval_name)
 
     for batch in iter(dl):
+        srs_befor = np.zeros((1,256,256,3), dtype=np.uint8)
+        gts_befor = np.zeros((1,256,256,3), dtype=np.uint8)
+        lrs_befor = np.zeros((50,256,256,3), dtype=np.uint8)
+        gt_keep_masks_befor = np.zeros((50,256,256,3), dtype=np.uint8)
+        
+        for idx in range(10):
+            print(f"idx is :{idx}")
+            batch_size = 50
+            for k in batch.keys():
+                if isinstance(batch[k], th.Tensor):
+                    if batch[k].shape[0] != batch_size: 
+                        c = th.cat((th.tensor(batch_size).reshape(1,1), th.ones(1, batch[k].dim() - 1)), dim=1)
+                        dim_for_tile = [int(x) for x in c[0]]
+                        dim_for_tile = tuple(dim_for_tile)
+                        batch[k] = th.tile(batch[k],dim_for_tile)
+                        batch[k] = batch[k].to(device)
+                    
 
-        for k in batch.keys():
-            if isinstance(batch[k], th.Tensor):
-                batch[k] = batch[k].to(device)
+            model_kwargs = {}
 
-        model_kwargs = {}
+            model_kwargs["gt"] = batch['GT']
 
-        model_kwargs["gt"] = batch['GT']
+            gt_keep_mask = batch.get('gt_keep_mask')
+            if gt_keep_mask is not None:
+                model_kwargs['gt_keep_mask'] = gt_keep_mask
 
-        gt_keep_mask = batch.get('gt_keep_mask')
-        if gt_keep_mask is not None:
-            model_kwargs['gt_keep_mask'] = gt_keep_mask
+            batch_size = model_kwargs["gt"].shape[0]
 
-        batch_size = model_kwargs["gt"].shape[0]
+            if conf.cond_y is not None:
+                classes = th.ones(batch_size, dtype=th.long, device=device)
+                model_kwargs["y"] = classes * conf.cond_y
+            else:
+                classes = th.randint(
+                    low=0, high=NUM_CLASSES, size=(batch_size,), device=device
+                )
+                model_kwargs["y"] = classes
 
-        if conf.cond_y is not None:
-            classes = th.ones(batch_size, dtype=th.long, device=device)
-            model_kwargs["y"] = classes * conf.cond_y
-        else:
-            classes = th.randint(
-                low=0, high=NUM_CLASSES, size=(batch_size,), device=device
+            sample_fn = (
+                diffusion.p_sample_loop if not conf.use_ddim else diffusion.ddim_sample_loop
             )
-            model_kwargs["y"] = classes
-
-        sample_fn = (
-            diffusion.p_sample_loop if not conf.use_ddim else diffusion.ddim_sample_loop
-        )
 
 
-        result = sample_fn(
-            model_fn,
-            (batch_size, 3, conf.image_size, conf.image_size),
-            clip_denoised=conf.clip_denoised,
-            model_kwargs=model_kwargs,
-            cond_fn=cond_fn,
-            device=device,
-            progress=show_progress,
-            return_all=True,
-            conf=conf
-        )
-        srs = toU8(result['sample'])
-        gts = toU8(result['gt'])
-        lrs = toU8(result.get('gt') * model_kwargs.get('gt_keep_mask') + (-1) *
-                   th.ones_like(result.get('gt')) * (1 - model_kwargs.get('gt_keep_mask')))
+            result = sample_fn(
+                model_fn,
+                (batch_size, 3, conf.image_size, conf.image_size),
+                clip_denoised=conf.clip_denoised,
+                model_kwargs=model_kwargs,
+                cond_fn=cond_fn,
+                device=device,
+                progress=show_progress,
+                return_all=True,
+                conf=conf
+            )
+            
+            for k in result.keys():
+                if isinstance(result[k], th.Tensor):
+                    result[k] = th.unsqueeze(th.mean(result[k], dim=0), dim=0)
+            
+            if idx > 0:
+                result['sample'] = (result['sample'] + result_sample_befor) / 2
+                result['gt'] = (result['gt'] + result_gt_befor) / 2
+                
+            result_sample_befor = result['sample']
+            result_gt_befor = result['gt']
+            
+            srs = toU8(result['sample'])
+            gts = toU8(result['gt'])
+            lrs = toU8(result.get('gt') * model_kwargs.get('gt_keep_mask') + (-1) *
+                    th.ones_like(result.get('gt')) * (1 - model_kwargs.get('gt_keep_mask')))
 
-        gt_keep_masks = toU8((model_kwargs.get('gt_keep_mask') * 2 - 1))
+            gt_keep_masks = toU8((model_kwargs.get('gt_keep_mask') * 2 - 1))
 
-        conf.eval_imswrite(
-            srs=srs, gts=gts, lrs=lrs, gt_keep_masks=gt_keep_masks,
-            img_names=batch['GT_name'], dset=dset, name=eval_name, verify_same=False)
+            # if idx > 0:
+            #     srs = ((srs + srs_befor) / 2).astype(np.uint8)
+                # gts = ((gts + gts_befor) / 2).astype(np.uint8)
+                # lrs = ((lrs + lrs_befor) / 2).astype(np.uint8)
+                # gt_keep_masks = ((gt_keep_masks + gt_keep_masks_befor) / 2).astype(np.uint8)
+            
+            # srs_befor = srs
+            # gts_befor = gts
+            # lrs_befor = lrs
+            # gt_keep_masks_befor = gt_keep_masks
+            conf.eval_imswrite(
+                srs=srs, gts=gts, lrs=lrs, gt_keep_masks=gt_keep_masks,
+                img_names=batch['GT_name'], dset=dset, name=eval_name, verify_same=False)
+        
+        print("image complete")
 
     print("sampling complete")
 
